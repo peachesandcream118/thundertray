@@ -1,0 +1,29 @@
+[package]
+name = "thundertray"
+version = "1.0.0"
+edition = "2021"
+description = "System tray daemon for Thunderbird on KDE Plasma Wayland"
+license = "MIT"
+readme = "README.md"
+keywords = ["thunderbird", "tray", "kde", "plasma", "wayland"]
+categories = ["email"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ksni = "0.3"
+zbus = "5"
+tokio = { version = "1", features = ["full"] }
+tiny-skia = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"

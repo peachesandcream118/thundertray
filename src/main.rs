@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(cli::Command::Install) => return installer::install(),
-        Some(cli::Command::Uninstall { purge }) => return installer::uninstall(purge),
+        Some(cli::Command::Uninstall) => return installer::uninstall(),
         Some(cli::Command::Settings) => return settings_gui::open_settings(),
         Some(cli::Command::Status) => return installer::status(),
         None => {} // Run daemon
@@ -63,7 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Install persistent KWin auto-hide listener (catches new TB windows instantly)
-    kwin_script::install_persistent_auto_hide().await?;
+    if let Err(e) = kwin_script::install_persistent_auto_hide().await {
+        tracing::warn!("Auto-hide listener failed to install (non-fatal): {}", e);
+    }
 
     // Start Thunderbird in background if configured
     let initial_child = if cfg.general.auto_start_thunderbird {

@@ -11,12 +11,8 @@ pub struct Cli {
 pub enum Command {
     /// Install ThunderTray (systemd service + autostart entry)
     Install,
-    /// Uninstall ThunderTray (stop service, remove files)
-    Uninstall {
-        /// Also remove configuration files
-        #[arg(long)]
-        purge: bool,
-    },
+    /// Uninstall ThunderTray (stop service, remove all files)
+    Uninstall,
     /// Open the settings dialog
     Settings,
     /// Show ThunderTray status

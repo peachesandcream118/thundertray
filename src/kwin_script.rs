@@ -128,13 +128,26 @@ workspace.windowAdded.connect(function(client) {
 /// Install the persistent auto-hide listener. Call once at startup.
 /// Returns a handle that can be used to uninstall on shutdown (optional — KWin cleans up on disconnect).
 pub async fn install_persistent_auto_hide() -> Result<i32, Box<dyn std::error::Error>> {
-    let counter = INVOCATION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let plugin_name = format!("thundertray_autohide_{}", counter);
+    let plugin_name = format!("thundertray_autohide_{}", std::process::id());
     let tmp_path = format!("/tmp/{}.js", plugin_name);
 
     std::fs::write(&tmp_path, AUTO_HIDE_LISTENER.as_bytes())?;
 
     let connection = Connection::session().await?;
+
+    // Unload any stale script with similar names from previous runs
+    for suffix in [std::process::id().to_string(), "0".to_string(), "1".to_string()] {
+        let old_name = format!("thundertray_autohide_{}", suffix);
+        let _ = connection
+            .call_method(
+                Some("org.kde.KWin"),
+                "/Scripting",
+                Some("org.kde.kwin.Scripting"),
+                "unloadScript",
+                &(old_name.as_str(),),
+            )
+            .await;
+    }
 
     let script_id: i32 = connection
         .call_method(

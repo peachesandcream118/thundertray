@@ -103,7 +103,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn uninstall(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     println!("Uninstalling ThunderTray...");
 
     // 1. Stop and disable systemd service
@@ -134,15 +134,23 @@ pub fn uninstall(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
         .args(["--user", "daemon-reload"])
         .status();
 
-    // 5. Optionally remove config
-    if purge {
-        let config_dir = config_dir_path()?;
-        if config_dir.exists() {
-            fs::remove_dir_all(&config_dir)?;
-            println!("  Removed config directory: {}", config_dir.display());
+    // 5. Remove config directory
+    let config_dir = config_dir_path()?;
+    if config_dir.exists() {
+        fs::remove_dir_all(&config_dir)?;
+        println!("  Removed config: {}", config_dir.display());
+    }
+
+    // 6. Clean up temp files
+    if let Ok(entries) = fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("thundertray_") && name.ends_with(".js") {
+                    let _ = fs::remove_file(entry.path());
+                    println!("  Removed temp: {}", entry.path().display());
+                }
+            }
         }
-    } else {
-        println!("  Config preserved (use --purge to remove)");
     }
 
     println!("\nThunderTray uninstalled.");

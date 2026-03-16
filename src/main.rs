@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Run tray (blocks forever)
+    // Run tray (blocks until shutdown signal)
     tray::run_tray(cfg, msf_files, initial_child).await?;
 
     Ok(())

@@ -44,6 +44,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
          ExecStart={bin_str}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         TimeoutStopSec=5\n\
          Environment=RUST_LOG=info\n\
          \n\
          [Install]\n\
@@ -52,28 +53,7 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&service_path, &service_content)?;
     println!("  Wrote systemd service: {}", service_path.display());
 
-    // 2. Write desktop autostart entry
-    let autostart = autostart_path()?;
-    if let Some(parent) = autostart.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let desktop_content = format!(
-        "[Desktop Entry]\n\
-         Name=ThunderTray\n\
-         Comment=System tray integration for Thunderbird\n\
-         Exec={bin_str}\n\
-         Icon=thunderbird\n\
-         Terminal=false\n\
-         Type=Application\n\
-         Categories=Email;Network;\n\
-         Keywords=thunderbird;mail;tray;notification;\n\
-         StartupNotify=false\n\
-         X-GNOME-Autostart-enabled=true\n"
-    );
-    fs::write(&autostart, &desktop_content)?;
-    println!("  Wrote autostart entry: {}", autostart.display());
-
-    // 3. Create default config if missing
+    // 2. Create default config if missing
     let config_dir = config_dir_path()?;
     let config_file = config_dir.join("config.toml");
     if !config_file.exists() {
@@ -96,6 +76,13 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Systemd service enabled and started");
     } else {
         println!("  Warning: systemctl enable failed (you may need to start manually)");
+    }
+
+    // Remove any stale desktop autostart entry (systemd handles startup)
+    let autostart = autostart_path()?;
+    if autostart.exists() {
+        let _ = fs::remove_file(&autostart);
+        println!("  Removed stale autostart entry (systemd handles startup)");
     }
 
     println!("\nThunderTray installed successfully!");

@@ -115,6 +115,8 @@ pub async fn run_tray(
 
     // Spawn TB watchdog — event-driven restart when TB exits
     let tb_cmd_wd = config.general.thunderbird_command.clone();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_wd = shutdown.clone();
     tokio::spawn(async move {
         // Get initial child handle, or spawn TB now to get one
         let wm = crate::window::WindowManager::new(&tb_cmd_wd);
@@ -130,8 +132,20 @@ pub async fn run_tray(
         };
         loop {
             // Event-driven: blocks here with zero CPU until TB actually exits
-            let status = child.wait().await;
-            info!("Thunderbird exited ({:?}) — restarting immediately", status);
+            tokio::select! {
+                status = child.wait() => {
+                    if shutdown_wd.is_cancelled() {
+                        info!("Watchdog: shutting down, not restarting TB");
+                        return;
+                    }
+                    info!("Thunderbird exited ({:?}) — restarting immediately", status);
+                }
+                _ = shutdown_wd.cancelled() => {
+                    info!("Watchdog: shutdown signal, killing Thunderbird");
+                    let _ = child.kill().await;
+                    return;
+                }
+            }
 
             // Brief pause to prevent runaway restart loops
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -139,6 +153,9 @@ pub async fn run_tray(
             // Restart and get new handle
             let wm = crate::window::WindowManager::new(&tb_cmd_wd);
             loop {
+                if shutdown_wd.is_cancelled() {
+                    return;
+                }
                 match wm.start_hidden().await {
                     Ok(new_child) => {
                         child = new_child;
@@ -154,22 +171,44 @@ pub async fn run_tray(
     });
 
     // Poll loop — check unread count periodically and update tray
+    // Also listens for SIGTERM/SIGINT to trigger clean shutdown
     let mut last_count = 0u32;
     let mut interval = tokio::time::interval(
         std::time::Duration::from_secs(config.monitoring.poll_interval_secs),
     );
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     loop {
-        interval.tick().await;
-        let new_count = watcher.get_unread_count();
-        if new_count != last_count {
-            info!("Unread count changed: {} -> {}", last_count, new_count);
-            handle.update(|tray| {
-                tray.unread_count = new_count;
-            }).await;
-            last_count = new_count;
+        tokio::select! {
+            _ = interval.tick() => {
+                let new_count = watcher.get_unread_count();
+                if new_count != last_count {
+                    info!("Unread count changed: {} -> {}", last_count, new_count);
+                    handle.update(|tray| {
+                        tray.unread_count = new_count;
+                    }).await;
+                    last_count = new_count;
+                }
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down");
+                shutdown.cancel();
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, shutting down");
+                shutdown.cancel();
+                break;
+            }
         }
     }
+
+    // Give watchdog a moment to kill TB
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    info!("ThunderTray stopped");
+    Ok(())
 }
 
 #[cfg(test)]

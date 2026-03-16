@@ -126,11 +126,27 @@ for (var i = 0; i < clients.length; i++) {
 const AUTO_HIDE_LISTENER: &str = r#"
 function connectActivation(client) {
     var addTime = Date.now();
+
+    // When TB is hidden and something tries to activate it (e.g. notification click),
+    // KWin can't activate a minimized+skipTaskbar window, so it sets demandsAttention.
+    // We catch that and restore the window.
+    client.demandsAttentionChanged.connect(function() {
+        if (!client.demandsAttention) return;
+        // Ignore within 3s of window creation (auto-hide takes priority)
+        if ((Date.now() - addTime) < 3000) return;
+        if (client.skipTaskbar) {
+            client.skipTaskbar = false;
+            client.skipSwitcher = false;
+            client.minimized = false;
+            workspace.activeWindow = client;
+            client.demandsAttention = false;
+        }
+    });
+
+    // Also handle case where activation succeeds (window was visible but not focused)
     client.activeChanged.connect(function() {
         if (!client.active) return;
-        // Ignore activation within 2s of window creation (auto-hide takes priority)
-        if ((Date.now() - addTime) < 2000) return;
-        // External activation (notification click etc) — restore the window
+        if ((Date.now() - addTime) < 3000) return;
         if (client.skipTaskbar) {
             client.skipTaskbar = false;
             client.skipSwitcher = false;

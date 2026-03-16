@@ -69,8 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start Thunderbird in background if configured
     let initial_child = if cfg.general.auto_start_thunderbird {
-        let visible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let wm = window::WindowManager::new(&cfg.general.thunderbird_command, visible);
+        let wm = window::WindowManager::new(&cfg.general.thunderbird_command);
         Some(wm.start_hidden().await?)
     } else {
         None

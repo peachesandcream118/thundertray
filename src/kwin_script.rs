@@ -4,20 +4,6 @@ use zbus::zvariant::ObjectPath;
 
 static INVOCATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Hide Thunderbird: minimize + remove from taskbar and alt-tab
-const HIDE_SCRIPT: &str = r#"
-var clients = workspace.windowList();
-for (var i = 0; i < clients.length; i++) {
-    var c = clients[i];
-    if (c.resourceClass === "org.mozilla.Thunderbird" || c.resourceName === "thunderbird") {
-        c.minimized = true;
-        c.skipTaskbar = true;
-        c.skipSwitcher = true;
-        break;
-    }
-}
-"#;
-
 /// Show Thunderbird: restore to taskbar, un-minimize, and focus
 const SHOW_SCRIPT: &str = r#"
 var clients = workspace.windowList();
@@ -106,23 +92,72 @@ pub async fn show_thunderbird_window() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-pub async fn hide_thunderbird_window() -> Result<(), Box<dyn std::error::Error>> {
-    run_kwin_script(HIDE_SCRIPT).await?;
-    tracing::debug!("Hid Thunderbird window");
+pub async fn toggle_thunderbird_window() -> Result<(), Box<dyn std::error::Error>> {
+    run_kwin_script(TOGGLE_SCRIPT).await?;
+    tracing::debug!("Toggled Thunderbird window");
     Ok(())
 }
 
-/// Persistent KWin listener that auto-hides any new Thunderbird window the instant it appears.
-/// This script stays loaded for the lifetime of thundertray — `windowAdded` only fires for
-/// NEW windows, so it won't interfere with show/hide toggle on existing windows.
+/// KWin script that toggles TB visibility based on actual window state (not Rust-side tracking).
+/// Checks skipTaskbar to determine current state — always correct regardless of external changes.
+const TOGGLE_SCRIPT: &str = r#"
+var clients = workspace.windowList();
+for (var i = 0; i < clients.length; i++) {
+    var c = clients[i];
+    if (c.resourceClass === "org.mozilla.Thunderbird" || c.resourceName === "thunderbird") {
+        if (c.skipTaskbar) {
+            c.skipTaskbar = false;
+            c.skipSwitcher = false;
+            c.minimized = false;
+            workspace.activeWindow = c;
+        } else {
+            c.minimized = true;
+            c.skipTaskbar = true;
+            c.skipSwitcher = true;
+        }
+        break;
+    }
+}
+"#;
+
+/// Persistent KWin listener that:
+/// 1. Auto-hides any new Thunderbird window the instant it appears
+/// 2. Watches for external activation (e.g. notification click) and restores the window
 const AUTO_HIDE_LISTENER: &str = r#"
+function connectActivation(client) {
+    var addTime = Date.now();
+    client.activeChanged.connect(function() {
+        if (!client.active) return;
+        // Ignore activation within 2s of window creation (auto-hide takes priority)
+        if ((Date.now() - addTime) < 2000) return;
+        // External activation (notification click etc) — restore the window
+        if (client.skipTaskbar) {
+            client.skipTaskbar = false;
+            client.skipSwitcher = false;
+            client.minimized = false;
+        }
+    });
+}
+
+// Handle new TB windows
 workspace.windowAdded.connect(function(client) {
     if (client.resourceClass === "org.mozilla.Thunderbird" || client.resourceName === "thunderbird") {
         client.minimized = true;
         client.skipTaskbar = true;
         client.skipSwitcher = true;
+        connectActivation(client);
     }
 });
+
+// Handle existing TB windows (already running when ThunderTray starts)
+var existingClients = workspace.windowList();
+for (var i = 0; i < existingClients.length; i++) {
+    (function(c) {
+        if (c.resourceClass === "org.mozilla.Thunderbird" || c.resourceName === "thunderbird") {
+            connectActivation(c);
+        }
+    })(existingClients[i]);
+}
 "#;
 
 /// Install the persistent auto-hide listener. Call once at startup.
@@ -189,15 +224,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hide_script_content() {
-        assert!(HIDE_SCRIPT.contains("org.mozilla.Thunderbird"));
-        assert!(HIDE_SCRIPT.contains("skipTaskbar"));
-        assert!(HIDE_SCRIPT.contains("skipSwitcher"));
-    }
-
-    #[test]
     fn test_show_script_content() {
         assert!(SHOW_SCRIPT.contains("org.mozilla.Thunderbird"));
         assert!(SHOW_SCRIPT.contains("activeWindow"));
+    }
+
+    #[test]
+    fn test_toggle_script_content() {
+        assert!(TOGGLE_SCRIPT.contains("org.mozilla.Thunderbird"));
+        assert!(TOGGLE_SCRIPT.contains("skipTaskbar"));
     }
 }

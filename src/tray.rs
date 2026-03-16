@@ -98,8 +98,6 @@ pub async fn run_tray(
 
     // Spawn toggle handler task with debouncing
     let tb_command = config.general.thunderbird_command.clone();
-    let visible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let vis_clone = visible.clone();
     tokio::spawn(async move {
         let mut last_toggle = std::time::Instant::now() - std::time::Duration::from_secs(1);
         while toggle_rx.recv().await.is_some() {
@@ -108,7 +106,7 @@ pub async fn run_tray(
                 continue;
             }
             last_toggle = std::time::Instant::now();
-            let wm = crate::window::WindowManager::new(&tb_command, vis_clone.clone());
+            let wm = crate::window::WindowManager::new(&tb_command);
             if let Err(e) = wm.toggle_visibility().await {
                 error!("Failed to toggle Thunderbird: {}", e);
             }
@@ -117,10 +115,9 @@ pub async fn run_tray(
 
     // Spawn TB watchdog — event-driven restart when TB exits
     let tb_cmd_wd = config.general.thunderbird_command.clone();
-    let vis_wd = visible.clone();
     tokio::spawn(async move {
         // Get initial child handle, or spawn TB now to get one
-        let wm = crate::window::WindowManager::new(&tb_cmd_wd, vis_wd.clone());
+        let wm = crate::window::WindowManager::new(&tb_cmd_wd);
         let mut child = match initial_child {
             Some(c) => c,
             None => match wm.start_hidden().await {
@@ -140,7 +137,7 @@ pub async fn run_tray(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             // Restart and get new handle
-            let wm = crate::window::WindowManager::new(&tb_cmd_wd, vis_wd.clone());
+            let wm = crate::window::WindowManager::new(&tb_cmd_wd);
             loop {
                 match wm.start_hidden().await {
                     Ok(new_child) => {

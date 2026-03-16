@@ -1,20 +1,15 @@
 //! Window management for Thunderbird on KDE Plasma 6 Wayland
 
 use std::error::Error;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct WindowManager {
     tb_command: String,
-    /// Tracks whether TB window is currently shown (visible) or hidden
-    visible: Arc<AtomicBool>,
 }
 
 impl WindowManager {
-    pub fn new(thunderbird_command: &str, visible: Arc<AtomicBool>) -> Self {
+    pub fn new(thunderbird_command: &str) -> Self {
         Self {
             tb_command: thunderbird_command.to_string(),
-            visible,
         }
     }
 
@@ -88,28 +83,21 @@ impl WindowManager {
     /// the window the instant it appears — fully event-driven, zero polling.
     pub async fn start_hidden(&self) -> Result<tokio::process::Child, Box<dyn Error>> {
         let child = self.spawn_thunderbird().await?;
-        self.visible.store(false, Ordering::Relaxed);
         tracing::info!("Thunderbird spawned (auto-hide listener will catch the window)");
         Ok(child)
     }
 
-    /// Toggle TB window: if visible -> hide, if hidden -> show, if not running -> start+show
+    /// Toggle TB window: checks actual KWin state so it's always correct,
+    /// even after external activation (e.g. notification click).
     pub async fn toggle_visibility(&self) -> Result<(), Box<dyn Error>> {
         if !self.is_thunderbird_running() {
             self.ensure_thunderbird_running().await?;
             self.wait_for_window().await;
             crate::kwin_script::show_thunderbird_window().await?;
-            self.visible.store(true, Ordering::Relaxed);
             return Ok(());
         }
 
-        if self.visible.load(Ordering::Relaxed) {
-            crate::kwin_script::hide_thunderbird_window().await?;
-            self.visible.store(false, Ordering::Relaxed);
-        } else {
-            crate::kwin_script::show_thunderbird_window().await?;
-            self.visible.store(true, Ordering::Relaxed);
-        }
+        crate::kwin_script::toggle_thunderbird_window().await?;
         Ok(())
     }
 }
@@ -120,8 +108,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let visible = Arc::new(AtomicBool::new(false));
-        let wm = WindowManager::new("thunderbird", visible);
+        let wm = WindowManager::new("thunderbird");
         assert_eq!(wm.tb_command, "thunderbird");
     }
 }

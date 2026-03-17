@@ -1,24 +1,62 @@
 use std::process::Command;
 
-/// Open the settings dialog. Uses kdialog (KDE) with zenity as fallback.
+const SETTINGS_SCRIPT: &str = include_str!("settings_dialog.py");
+
+/// Open the settings dialog — a single form window with all settings visible.
 pub fn open_settings() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = crate::config::Config::load()?;
 
-    if has_command("kdialog") {
-        run_kdialog_settings(&mut config)?;
-    } else if has_command("zenity") {
-        run_zenity_settings(&mut config)?;
-    } else {
-        let config_path = dirs::config_dir()
-            .map(|d| d.join("thundertray/config.toml"))
-            .unwrap_or_default();
-        println!("No GUI dialog tool found (kdialog or zenity).");
-        println!("Edit the config file directly: {}", config_path.display());
+    if !has_command("python3") {
+        show_fallback_message();
         return Ok(());
     }
 
-    config.save()?;
-    println!("Settings saved.");
+    let script_path = std::env::temp_dir().join("thundertray_settings.py");
+    std::fs::write(&script_path, SETTINGS_SCRIPT)?;
+
+    let output = Command::new("python3")
+        .arg(&script_path)
+        .arg(&config.general.thunderbird_command)
+        .arg(config.general.auto_start_thunderbird.to_string())
+        .arg(&config.appearance.badge_color)
+        .arg(&config.appearance.badge_text_color)
+        .arg(config.monitoring.poll_interval_secs.to_string())
+        .output()?;
+
+    let _ = std::fs::remove_file(&script_path);
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.trim().lines().collect();
+        if lines.len() == 5 {
+            let cmd = lines[0].trim();
+            if !cmd.is_empty() {
+                config.general.thunderbird_command = cmd.to_string();
+            }
+            config.general.auto_start_thunderbird = lines[1].trim() == "true";
+            let badge = lines[2].trim();
+            if badge.starts_with('#') && badge.len() >= 4 {
+                config.appearance.badge_color = badge.to_string();
+            }
+            let text_col = lines[3].trim();
+            if text_col.starts_with('#') && text_col.len() >= 4 {
+                config.appearance.badge_text_color = text_col.to_string();
+            }
+            if let Ok(secs) = lines[4].trim().parse::<u64>() {
+                if secs >= 1 {
+                    config.monitoring.poll_interval_secs = secs;
+                }
+            }
+            config.save()?;
+            println!("Settings saved.");
+        }
+    } else {
+        match output.status.code() {
+            Some(2) => show_fallback_message(),
+            _ => println!("Settings cancelled."),
+        }
+    }
+
     Ok(())
 }
 
@@ -35,10 +73,23 @@ pub fn open_settings_detached() {
         Ok(mut child) => {
             tracing::info!("Settings dialog opened");
             // Reap in background thread to prevent zombie
-            std::thread::spawn(move || { let _ = child.wait(); });
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
         Err(e) => tracing::error!("Failed to open settings dialog: {}", e),
     }
+}
+
+fn show_fallback_message() {
+    let config_path = dirs::config_dir()
+        .map(|d| d.join("thundertray/config.toml"))
+        .unwrap_or_default();
+    println!(
+        "No GUI toolkit available (needs python3 with PyQt6, PySide6, PyQt5, or tkinter).\n\
+         Edit the config file directly: {}",
+        config_path.display()
+    );
 }
 
 fn has_command(name: &str) -> bool {
@@ -47,148 +98,4 @@ fn has_command(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-fn run_kdialog_settings(config: &mut crate::config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    // Thunderbird command
-    if let Ok(output) = Command::new("kdialog")
-        .args([
-            "--title", "ThunderTray Settings",
-            "--inputbox", "Thunderbird command (binary name or full path):",
-            &config.general.thunderbird_command,
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !val.is_empty() {
-                config.general.thunderbird_command = val;
-            }
-        } else {
-            // User pressed Cancel
-            println!("Settings cancelled.");
-            return Ok(());
-        }
-    }
-
-    // Auto-start Thunderbird
-    let auto_start_result = Command::new("kdialog")
-        .args([
-            "--title", "ThunderTray Settings",
-            "--yesno", "Auto-start Thunderbird when ThunderTray starts?",
-        ])
-        .status();
-    if let Ok(status) = auto_start_result {
-        // kdialog: 0 = Yes, 1 = No, other = Cancel
-        if status.code() == Some(0) {
-            config.general.auto_start_thunderbird = true;
-        } else if status.code() == Some(1) {
-            config.general.auto_start_thunderbird = false;
-        }
-    }
-
-    // Badge color
-    if let Ok(output) = Command::new("kdialog")
-        .args([
-            "--title", "ThunderTray Settings",
-            "--getcolor",
-            "--default", &config.appearance.badge_color,
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !val.is_empty() {
-                config.appearance.badge_color = val;
-            }
-        }
-    }
-
-    // Badge text color
-    if let Ok(output) = Command::new("kdialog")
-        .args([
-            "--title", "ThunderTray Settings",
-            "--getcolor",
-            "--default", &config.appearance.badge_text_color,
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !val.is_empty() {
-                config.appearance.badge_text_color = val;
-            }
-        }
-    }
-
-    // Poll interval
-    if let Ok(output) = Command::new("kdialog")
-        .args([
-            "--title", "ThunderTray Settings",
-            "--inputbox", "Mail check interval (seconds):",
-            &config.monitoring.poll_interval_secs.to_string(),
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Ok(secs) = val.parse::<u64>() {
-                if secs >= 1 {
-                    config.monitoring.poll_interval_secs = secs;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn run_zenity_settings(config: &mut crate::config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    // Zenity forms approach — simpler but functional
-    if let Ok(output) = Command::new("zenity")
-        .args([
-            "--forms",
-            "--title=ThunderTray Settings",
-            "--text=Configure ThunderTray",
-            "--add-entry=Thunderbird command",
-            "--add-entry=Poll interval (seconds)",
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let parts: Vec<&str> = val.split('|').collect();
-            if let Some(cmd) = parts.first() {
-                if !cmd.is_empty() {
-                    config.general.thunderbird_command = cmd.to_string();
-                }
-            }
-            if let Some(interval) = parts.get(1) {
-                if let Ok(secs) = interval.parse::<u64>() {
-                    if secs >= 1 {
-                        config.monitoring.poll_interval_secs = secs;
-                    }
-                }
-            }
-        }
-    }
-
-    // Color picker for badge
-    if let Ok(output) = Command::new("zenity")
-        .args([
-            "--color-selection",
-            "--title=Badge Color",
-            &format!("--color={}", config.appearance.badge_color),
-        ])
-        .output()
-    {
-        if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !val.is_empty() {
-                config.appearance.badge_color = val;
-            }
-        }
-    }
-
-    Ok(())
 }

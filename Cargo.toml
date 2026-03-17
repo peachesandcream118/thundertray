@@ -1,6 +1,6 @@
 [package]
 name = "thundertray"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "System tray daemon for Thunderbird on KDE Plasma Wayland"
 license = "MIT"

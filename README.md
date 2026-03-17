@@ -1,6 +1,6 @@
 # ThunderTray
 
-A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wayland. Think [birdtray](https://github.com/gyunaev/birdtray), but built from scratch in Rust for modern Wayland desktops.
+A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wayland. Think [birdtray](https://github.com/gyunaev/birdtray), but vibecoded in Rust for modern Wayland desktops.
 
 ## Features
 
@@ -11,7 +11,6 @@ A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wa
 - **Auto-detect** Thunderbird profile and INBOX folders
 - **Settings GUI** via kdialog (right-click tray → Settings)
 - **CLI subcommands** — `install`, `uninstall`, `settings`, `status`
-- **Zero-CPU idle** — event-driven architecture, no busy polling
 
 ## Requirements
 
@@ -22,23 +21,28 @@ A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wa
 
 ## Quick Start
 
+1. Download the latest `thundertray` binary from [Releases](https://github.com/peachesandcream118/thundertray/releases)
+2. Make it executable and install:
+
 ```bash
-# Build and install
-cargo install --path .
+chmod +x thundertray
+./thundertray install
+```
 
-# Set up autostart (systemd service + desktop entry)
-thundertray install
+That's it — ThunderTray is now running in your system tray and will start automatically on login.
 
-# Or just run it directly
-thundertray
+To remove it later:
+
+```bash
+thundertray uninstall
 ```
 
 ## CLI Usage
 
 ```
 thundertray              Run the tray daemon (default)
-thundertray install      Install systemd service + autostart entry
-thundertray uninstall    Remove service + autostart (add --purge to remove config)
+thundertray install      Install systemd service + autostart entry, enable and start
+thundertray uninstall    Stop service, remove all files (service, autostart, config, temp)
 thundertray settings     Open the settings dialog
 thundertray status       Show service and Thunderbird status
 ```
@@ -83,7 +87,7 @@ main.rs            — CLI dispatch + daemon startup
 ## Building from Source
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/peachesandcream118/thundertray.git
 cd thundertray
 cargo build --release
 # Binary at target/release/thundertray

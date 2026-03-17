@@ -32,7 +32,11 @@ pub fn open_settings_detached() {
         }
     };
     match Command::new(bin).arg("settings").spawn() {
-        Ok(_) => tracing::info!("Settings dialog opened"),
+        Ok(mut child) => {
+            tracing::info!("Settings dialog opened");
+            // Reap in background thread to prevent zombie
+            std::thread::spawn(move || { let _ = child.wait(); });
+        }
         Err(e) => tracing::error!("Failed to open settings dialog: {}", e),
     }
 }

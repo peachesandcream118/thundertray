@@ -36,12 +36,16 @@ impl WindowManager {
         Ok(child)
     }
 
-    /// Start Thunderbird if not already running (fire-and-forget, no handle returned)
+    /// Start Thunderbird if not already running (fire-and-forget, spawns reaper)
     pub async fn ensure_thunderbird_running(&self) -> Result<(), Box<dyn Error>> {
         if !self.is_thunderbird_running() {
             tracing::info!("Starting Thunderbird: {}", self.tb_command);
-            tokio::process::Command::new(&self.tb_command)
+            let mut child = tokio::process::Command::new(&self.tb_command)
                 .spawn()?;
+            // Reap the child in the background to prevent zombies
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
         }
         Ok(())
     }

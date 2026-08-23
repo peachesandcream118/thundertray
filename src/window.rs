@@ -2,14 +2,22 @@
 
 use std::error::Error;
 
+type WindowError = Box<dyn Error + Send + Sync>;
+
 pub struct WindowManager {
-    tb_command: String,
+    program: String,
+    args: Vec<String>,
 }
 
 impl WindowManager {
     pub fn new(thunderbird_command: &str) -> Self {
+        let mut parts = shlex::split(thunderbird_command)
+            .filter(|parts| !parts.is_empty())
+            .unwrap_or_else(|| vec!["thunderbird".to_string()]);
+        let program = parts.remove(0);
         Self {
-            tb_command: thunderbird_command.to_string(),
+            program,
+            args: parts,
         }
     }
 
@@ -18,9 +26,7 @@ impl WindowManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Ok(cmdline) = std::fs::read_to_string(path.join("cmdline")) {
-                    // cmdline has null-separated args; check the first arg (the binary)
-                    let exe = cmdline.split('\0').next().unwrap_or("");
-                    if exe.contains("/thunderbird") || exe == "thunderbird" {
+                    if process_looks_like_thunderbird(&cmdline) {
                         return true;
                     }
                 }
@@ -30,17 +36,20 @@ impl WindowManager {
     }
 
     /// Spawn Thunderbird and return the process handle (for event-driven monitoring)
-    pub async fn spawn_thunderbird(&self) -> Result<tokio::process::Child, Box<dyn Error>> {
-        tracing::info!("Starting Thunderbird: {}", self.tb_command);
-        let child = tokio::process::Command::new(&self.tb_command).spawn()?;
+    pub async fn spawn_thunderbird(&self) -> Result<tokio::process::Child, WindowError> {
+        tracing::info!("Starting Thunderbird: {} {:?}", self.program, self.args);
+        let child = tokio::process::Command::new(&self.program)
+            .args(&self.args)
+            .spawn()?;
         Ok(child)
     }
 
     /// Start Thunderbird if not already running (fire-and-forget, spawns reaper)
-    pub async fn ensure_thunderbird_running(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn ensure_thunderbird_running(&self) -> Result<(), WindowError> {
         if !self.is_thunderbird_running() {
-            tracing::info!("Starting Thunderbird: {}", self.tb_command);
-            let mut child = tokio::process::Command::new(&self.tb_command)
+            tracing::info!("Starting Thunderbird: {} {:?}", self.program, self.args);
+            let mut child = tokio::process::Command::new(&self.program)
+                .args(&self.args)
                 .spawn()?;
             // Reap the child in the background to prevent zombies
             tokio::spawn(async move {
@@ -69,8 +78,7 @@ impl WindowManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Ok(cmdline) = std::fs::read_to_string(path.join("cmdline")) {
-                    let exe = cmdline.split('\0').next().unwrap_or("");
-                    if exe.contains("/thunderbird") || exe == "thunderbird" {
+                    if process_looks_like_thunderbird(&cmdline) {
                         // Check if it has enough threads (window created = many threads)
                         if let Ok(tasks) = std::fs::read_dir(path.join("task")) {
                             return tasks.count() > 5;
@@ -83,17 +91,23 @@ impl WindowManager {
     }
 
     /// Start TB hidden, returning the Child handle for event-driven monitoring.
-    /// Relies on the persistent KWin auto-hide listener (installed at startup) to hide
-    /// the window the instant it appears — fully event-driven, zero polling.
-    pub async fn start_hidden(&self) -> Result<tokio::process::Child, Box<dyn Error>> {
+    /// Hides only the window belonging to this explicit start. There is no persistent
+    /// listener, so compose windows and Thunderbird instances opened by the user are untouched.
+    pub async fn start_hidden(&self) -> Result<tokio::process::Child, WindowError> {
         let child = self.spawn_thunderbird().await?;
-        tracing::info!("Thunderbird spawned (auto-hide listener will catch the window)");
+        if self.wait_for_window().await {
+            if let Err(error) = crate::kwin_script::hide_thunderbird_window().await {
+                tracing::warn!("Thunderbird started, but its window could not be hidden: {error}");
+            }
+        } else {
+            tracing::warn!("Thunderbird started, but no window appeared within 5 seconds");
+        }
         Ok(child)
     }
 
     /// Toggle TB window: checks actual KWin state so it's always correct,
     /// even after external activation (e.g. notification click).
-    pub async fn toggle_visibility(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn toggle_visibility(&self) -> Result<(), WindowError> {
         if !self.is_thunderbird_running() {
             self.ensure_thunderbird_running().await?;
             self.wait_for_window().await;
@@ -106,6 +120,16 @@ impl WindowManager {
     }
 }
 
+fn process_looks_like_thunderbird(cmdline: &str) -> bool {
+    cmdline.split('\0').any(|arg| {
+        std::path::Path::new(arg)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("thunderbird"))
+            || arg.contains("org.mozilla.Thunderbird")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +137,25 @@ mod tests {
     #[test]
     fn test_new() {
         let wm = WindowManager::new("thunderbird");
-        assert_eq!(wm.tb_command, "thunderbird");
+        assert_eq!(wm.program, "thunderbird");
+        assert!(wm.args.is_empty());
+    }
+
+    #[test]
+    fn test_command_with_arguments_is_split_without_shell() {
+        let wm = WindowManager::new("snap run thunderbird");
+        assert_eq!(wm.program, "snap");
+        assert_eq!(wm.args, ["run", "thunderbird"]);
+    }
+
+    #[test]
+    fn test_snap_process_is_detected_from_arguments() {
+        assert!(process_looks_like_thunderbird(
+            "/usr/bin/snap\0run\0thunderbird\0"
+        ));
+        assert!(process_looks_like_thunderbird(
+            "/usr/bin/flatpak\0run\0org.mozilla.Thunderbird\0"
+        ));
+        assert!(!process_looks_like_thunderbird("/usr/bin/bash\0"));
     }
 }

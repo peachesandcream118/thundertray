@@ -1,9 +1,14 @@
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
-fn get_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(std::env::current_exe()?)
+fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    dirs::home_dir().ok_or_else(|| "Could not determine home directory".into())
+}
+
+fn stable_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(home_dir()?.join(".local/bin/thundertray"))
 }
 
 fn systemd_service_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -21,14 +26,42 @@ fn config_dir_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(config.join("thundertray"))
 }
 
+fn run_systemctl(args: &[&str]) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    Ok(Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()?)
+}
+
+fn require_success(operation: &str, status: ExitStatus) -> Result<(), Box<dyn std::error::Error>> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{operation} failed with {status}").into())
+    }
+}
+
+fn systemd_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 pub fn install() -> Result<(), Box<dyn std::error::Error>> {
-    let bin_path = get_binary_path()?;
-    let bin_str = bin_path.display();
+    let source = std::env::current_exe()?;
+    let installed_binary = stable_binary_path()?;
 
     println!("Installing ThunderTray...");
-    println!("  Binary: {}", bin_str);
+    if source != installed_binary {
+        if let Some(parent) = installed_binary.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &installed_binary)?;
+        fs::set_permissions(&installed_binary, fs::Permissions::from_mode(0o755))?;
+        println!("  Installed binary: {}", installed_binary.display());
+    } else {
+        println!("  Binary already installed: {}", installed_binary.display());
+    }
 
-    // 1. Write systemd service
     let service_path = systemd_service_path()?;
     if let Some(parent) = service_path.parent() {
         fs::create_dir_all(parent)?;
@@ -41,154 +74,203 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={bin_str}\n\
+         ExecStart={}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         TimeoutStopSec=5\n\
          Environment=RUST_LOG=info\n\
+         Environment=PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/flatpak/exports/bin:/snap/bin\n\
          \n\
          [Install]\n\
-         WantedBy=graphical-session.target\n"
+         WantedBy=graphical-session.target\n",
+        systemd_quote(&installed_binary)
     );
-    fs::write(&service_path, &service_content)?;
-    println!("  Wrote systemd service: {}", service_path.display());
+    fs::write(&service_path, service_content)?;
+    println!("  Wrote user service: {}", service_path.display());
 
-    // 2. Create default config if missing
-    let config_dir = config_dir_path()?;
-    let config_file = config_dir.join("config.toml");
+    let config_file = config_dir_path()?.join("config.toml");
     if !config_file.exists() {
-        let config = crate::config::Config::default();
-        config.save()?;
+        crate::config::Config::default().save()?;
         println!("  Created default config: {}", config_file.display());
     } else {
-        println!("  Config already exists: {}", config_file.display());
+        crate::config::Config::load()?;
+        println!("  Kept existing valid config: {}", config_file.display());
     }
 
-    // 4. Enable and start systemd service
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-    let status = Command::new("systemctl")
-        .args(["--user", "enable", "--now", "thundertray"])
-        .status()?;
+    let stale_autostart = autostart_path()?;
+    if stale_autostart.exists() {
+        fs::remove_file(&stale_autostart)?;
+        println!("  Removed obsolete desktop autostart entry");
+    }
 
-    if status.success() {
-        println!("  Systemd service enabled and started");
+    require_success(
+        "systemd user daemon reload",
+        run_systemctl(&["daemon-reload"])?,
+    )?;
+    let was_active = run_systemctl(&["is-active", "--quiet", "thundertray.service"])
+        .is_ok_and(|status| status.success());
+    require_success(
+        "enabling ThunderTray at login",
+        run_systemctl(&["enable", "thundertray.service"])?,
+    )?;
+    let activation = if was_active {
+        run_systemctl(&["restart", "thundertray.service"])?
     } else {
-        println!("  Warning: systemctl enable failed (you may need to start manually)");
-    }
+        run_systemctl(&["start", "thundertray.service"])?
+    };
+    require_success(
+        if was_active {
+            "restarting ThunderTray after update"
+        } else {
+            "starting ThunderTray"
+        },
+        activation,
+    )?;
 
-    // Remove any stale desktop autostart entry (systemd handles startup)
-    let autostart = autostart_path()?;
-    if autostart.exists() {
-        let _ = fs::remove_file(&autostart);
-        println!("  Removed stale autostart entry (systemd handles startup)");
-    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    require_success(
+        "ThunderTray service health check",
+        run_systemctl(&["is-active", "--quiet", "thundertray.service"])?,
+    )?;
 
-    println!("\nThunderTray installed successfully!");
-    println!("It will start automatically on login.");
+    println!("ThunderTray is running. Look for the envelope in the system tray.");
     Ok(())
 }
 
-pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
+pub fn uninstall(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("Uninstalling ThunderTray...");
 
-    // 1. Stop and disable systemd service
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", "thundertray"])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "thundertray"])
-        .status();
-    println!("  Stopped and disabled systemd service");
+    let stopped = run_systemctl(&["disable", "--now", "thundertray.service"])
+        .is_ok_and(|status| status.success());
+    if !stopped
+        && run_systemctl(&["is-active", "--quiet", "thundertray.service"])
+            .is_ok_and(|status| status.success())
+    {
+        return Err(
+            "Could not stop the running ThunderTray service; installed files were kept".into(),
+        );
+    }
 
-    // 2. Remove systemd service file
     let service_path = systemd_service_path()?;
     if service_path.exists() {
         fs::remove_file(&service_path)?;
-        println!("  Removed: {}", service_path.display());
+        println!("  Removed service: {}", service_path.display());
     }
 
-    // 3. Remove autostart entry
-    let autostart = autostart_path()?;
-    if autostart.exists() {
-        fs::remove_file(&autostart)?;
-        println!("  Removed: {}", autostart.display());
+    let stale_autostart = autostart_path()?;
+    if stale_autostart.exists() {
+        fs::remove_file(&stale_autostart)?;
+        println!("  Removed obsolete autostart entry");
     }
 
-    // 4. Reload systemd
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
+    let _ = run_systemctl(&["daemon-reload"]);
 
-    // 5. Remove config directory
+    let installed_binary = stable_binary_path()?;
+    if installed_binary.exists() {
+        fs::remove_file(&installed_binary)?;
+        println!("  Removed binary: {}", installed_binary.display());
+    }
+
     let config_dir = config_dir_path()?;
-    if config_dir.exists() {
+    if purge && config_dir.exists() {
         fs::remove_dir_all(&config_dir)?;
-        println!("  Removed config: {}", config_dir.display());
+        println!("  Purged config: {}", config_dir.display());
+    } else if config_dir.exists() {
+        println!("  Kept config: {}", config_dir.display());
     }
 
-    // 6. Clean up temp files
-    if let Ok(entries) = fs::read_dir("/tmp") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("thundertray_") && name.ends_with(".js") {
-                    let _ = fs::remove_file(entry.path());
-                    println!("  Removed temp: {}", entry.path().display());
-                }
-            }
-        }
-    }
-
-    println!("\nThunderTray uninstalled.");
+    println!("ThunderTray uninstalled. Thunderbird was left running.");
     Ok(())
 }
 
 pub fn status() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if service is active
-    let service_status = Command::new("systemctl")
-        .args(["--user", "is-active", "thundertray"])
-        .output();
+    let active = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "thundertray.service"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let service_path = systemd_service_path()?;
+    let installed_binary = stable_binary_path()?;
+    let config_file = config_dir_path()?.join("config.toml");
+    let thunderbird_running =
+        crate::window::WindowManager::new("thunderbird").is_thunderbird_running();
 
-    let active = match &service_status {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).trim() == "active",
-        Err(_) => false,
+    println!("ThunderTray status");
+    println!("  Service: {}", if active { "running" } else { "stopped" });
+    println!(
+        "  Installed binary: {} ({})",
+        installed_binary.display(),
+        if installed_binary.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Service file: {} ({})",
+        service_path.display(),
+        if service_path.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Thunderbird: {}",
+        if thunderbird_running {
+            "running"
+        } else {
+            "not running"
+        }
+    );
+    println!(
+        "  Config: {} ({})",
+        config_file.display(),
+        if config_file.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+
+    let profile = if config_file.exists() {
+        let config = crate::config::Config::load()?;
+        match config.monitoring.profile_path {
+            Some(path) => Ok(path),
+            None => crate::config::detect_thunderbird_profile_for_command(
+                &config.general.thunderbird_command,
+            ),
+        }
+    } else {
+        crate::config::detect_thunderbird_profile()
     };
 
-    println!("ThunderTray Status");
-    println!("==================");
-    println!("  Service: {}", if active { "running" } else { "stopped" });
+    match profile {
+        Ok(profile) => {
+            let inboxes = crate::config::discover_inbox_msf_files(&profile);
+            let unread = crate::watcher::MailWatcher::new(inboxes.clone(), 5).get_unread_count();
+            println!("  Profile: {}", profile.display());
+            println!(
+                "  Monitoring: {} inbox(es), {} unread",
+                inboxes.len(),
+                unread
+            );
+        }
+        Err(error) => println!("  Profile: not found ({error})"),
+    }
 
-    // Check if TB is running
-    let tb_running = std::fs::read_dir("/proc")
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                std::fs::read_to_string(entry.path().join("cmdline"))
-                    .map(|cmd| {
-                        let exe = cmd.split('\0').next().unwrap_or("");
-                        exe.contains("/thunderbird") || exe == "thunderbird"
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-    println!("  Thunderbird: {}", if tb_running { "running" } else { "not running" });
-
-    // Config path
-    let config_dir = config_dir_path()?;
-    let config_file = config_dir.join("config.toml");
-    println!("  Config: {}", config_file.display());
-    println!("  Config exists: {}", config_file.exists());
-
-    // Service file
-    let service_path = systemd_service_path()?;
-    println!("  Service file: {}", service_path.display());
-    println!("  Service installed: {}", service_path.exists());
-
-    // Autostart
-    let autostart = autostart_path()?;
-    println!("  Autostart: {}", autostart.display());
-    println!("  Autostart installed: {}", autostart.exists());
-
+    if !active {
+        println!("  Remedy: run `thundertray install` or inspect `journalctl --user -u thundertray -n 20`.");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::systemd_quote;
+    use std::path::Path;
+
+    #[test]
+    fn systemd_path_is_quoted_and_escaped() {
+        assert_eq!(systemd_quote(Path::new("/tmp/a b")), "\"/tmp/a b\"");
+        assert_eq!(systemd_quote(Path::new("/tmp/a\\b")), "\"/tmp/a\\\\b\"");
+    }
 }

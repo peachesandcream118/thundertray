@@ -1,15 +1,15 @@
 # ThunderTray
 
-A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wayland. Think [birdtray](https://github.com/gyunaev/birdtray), but vibecoded in Rust for modern Wayland desktops.
+A lightweight system tray application for Thunderbird on KDE Plasma 6 Wayland, written in Rust.
 
 ## Features
 
 - **System tray icon** with live unread message count badge
 - **Click to show/hide** Thunderbird (via KWin D-Bus scripting — no X11 needed)
 - **Auto-start & auto-hide** — launches Thunderbird hidden on login
-- **Event-driven watchdog** — instantly restarts Thunderbird if it exits
-- **Auto-detect** Thunderbird profile and INBOX folders
-- **Settings GUI** via kdialog (right-click tray → Settings)
+- **Bounded watchdog** — restarts Thunderbird after an unexpected exit and pauses after repeated failures
+- **Auto-detect** native, Snap, and Flatpak Thunderbird profiles and INBOX folders
+- **Settings GUI** via Python with PyQt/PySide or tkinter (right-click tray → Settings)
 - **CLI subcommands** — `install`, `uninstall`, `settings`, `status`
 
 ## Requirements
@@ -17,7 +17,7 @@ A lightweight, native system tray application for Thunderbird on KDE Plasma 6 Wa
 - KDE Plasma 6 (Wayland) with KWin
 - Thunderbird
 - D-Bus session bus
-- `kdialog` (optional, for settings GUI — pre-installed on KDE)
+- Python 3 with PyQt6, PySide6, PyQt5, or tkinter (optional, for the settings GUI)
 
 ## Quick Start
 
@@ -41,8 +41,10 @@ thundertray uninstall
 
 ```
 thundertray              Run the tray daemon (default)
-thundertray install      Install systemd service + autostart entry, enable and start
-thundertray uninstall    Stop service, remove all files (service, autostart, config, temp)
+thundertray install      Install the stable binary and user service, then enable and start it
+thundertray uninstall    Stop the service and remove installed program files; keep config
+thundertray uninstall --purge
+                         Also remove the saved configuration
 thundertray settings     Open the settings dialog
 thundertray status       Show service and Thunderbird status
 ```
@@ -68,16 +70,21 @@ poll_interval_secs = 5
 
 You can also edit settings via the GUI: right-click the tray icon → **Settings**, or run `thundertray settings`.
 
+If Thunderbird is installed as a Snap and `thunderbird` is not available to the user service,
+set `thunderbird_command = "snap run thunderbird"`. Flatpak users can set
+`thunderbird_command = "flatpak run org.mozilla.Thunderbird"`.
+
 ## Architecture
 
 ```
 main.rs            — CLI dispatch + daemon startup
 ├── cli.rs         — Clap CLI definition
 ├── installer.rs   — Install/uninstall/status subcommands
-├── settings_gui.rs — kdialog/zenity settings GUI
-├── config.rs      — TOML config + Thunderbird profile detection
-├── mork.rs        — Mork .msf parser + mbox fallback for unread counts
-├── icon.rs        — 24×24 tray icon rendering with badge (tiny-skia)
+├── settings_gui.rs — optional Python settings GUI
+├── config.rs      — TOML configuration and validation
+├── thunderbird.rs — native/Snap/Flatpak profile detection
+├── mork.rs        — Thunderbird unread cache + mbox fallback
+├── icon.rs        — tray icon rendering with unread badge (tiny-skia)
 ├── window.rs      — Thunderbird process management
 ├── kwin_script.rs — KWin D-Bus scripting for window show/hide
 ├── watcher.rs     — Mail file monitoring

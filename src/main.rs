@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(cli::Command::Install) => return installer::install(),
-        Some(cli::Command::Uninstall) => return installer::uninstall(),
+        Some(cli::Command::Uninstall { purge }) => return installer::uninstall(purge),
         Some(cli::Command::Settings) => return settings_gui::open_settings(),
         Some(cli::Command::Status) => return installer::status(),
         None => {} // Run daemon
@@ -35,23 +35,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("ThunderTray starting");
 
     // Load config (creates default if missing)
-    let mut cfg = config::Config::load()?;
+    let mut cfg = match config::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(
+                "Could not load ThunderTray configuration ({error}); using safe defaults without overwriting the file"
+            );
+            config::Config::default()
+        }
+    };
     info!("Config loaded");
 
     // Resolve Thunderbird profile path
     let profile_path = match &cfg.monitoring.profile_path {
-        Some(p) => p.clone(),
+        Some(path) => Some(path.clone()),
         None => {
-            let detected = config::detect_thunderbird_profile()?;
-            info!("Auto-detected Thunderbird profile: {:?}", detected);
-            cfg.monitoring.profile_path = Some(detected.clone());
-            detected
+            match config::detect_thunderbird_profile_for_command(&cfg.general.thunderbird_command) {
+                Ok(detected) => {
+                    info!("Auto-detected Thunderbird profile: {:?}", detected);
+                    cfg.monitoring.profile_path = Some(detected.clone());
+                    Some(detected)
+                }
+                Err(error) => {
+                    tracing::error!(
+                    "No Thunderbird profile found ({error}). The tray will keep running; set monitoring.profile_path in the config after Thunderbird creates a profile."
+                );
+                    None
+                }
+            }
         }
     };
 
     // Discover .msf files to monitor
     let msf_files = if cfg.monitoring.folders.is_empty() {
-        let discovered = config::discover_inbox_msf_files(&profile_path);
+        let discovered = profile_path
+            .as_deref()
+            .map(config::discover_inbox_msf_files)
+            .unwrap_or_default();
         info!("Discovered {} INBOX.msf files", discovered.len());
         discovered
     } else {
@@ -62,21 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("No .msf files found to monitor. Tray will show 0 unread.");
     }
 
-    // Install persistent KWin auto-hide listener (catches new TB windows instantly)
-    if let Err(e) = kwin_script::install_persistent_auto_hide().await {
-        tracing::warn!("Auto-hide listener failed to install (non-fatal): {}", e);
-    }
-
-    // Start Thunderbird in background if configured
-    let initial_child = if cfg.general.auto_start_thunderbird {
-        let wm = window::WindowManager::new(&cfg.general.thunderbird_command);
-        Some(wm.start_hidden().await?)
-    } else {
-        None
-    };
-
-    // Run tray (blocks until shutdown signal)
-    tray::run_tray(cfg, msf_files, initial_child).await?;
+    // Run tray first; its watchdog starts Thunderbird afterwards so launch failures never
+    // prevent the user from getting a tray icon and a recoverable process.
+    tray::run_tray(cfg, msf_files).await?;
 
     Ok(())
 }

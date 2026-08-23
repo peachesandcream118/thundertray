@@ -1,169 +1,97 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Parse a single .msf file and return the unread message count.
-/// Returns 0 if the file cannot be parsed or has no unread messages.
+const MSG_FLAG_READ: u16 = 0x0001;
+const MSG_FLAG_EXPUNGED: u16 = 0x0008;
+
+/// Return the same unread total Thunderbird exposes for a folder.
+///
+/// Thunderbird persists this value in the profile's `folderCache.json`, keyed
+/// by the exact summary-file path. The cache is the authoritative lightweight
+/// source: it avoids trying to reconstruct Mork's transaction log and, unlike
+/// `numNewMsgs`, represents the real unread total rather than biff-only mail.
 pub fn parse_unread_count(msf_path: &Path) -> u32 {
-    let count = parse_mork_unread(msf_path);
-    if count > 0 {
+    if let Some(count) = parse_folder_cache_unread(msf_path) {
         return count;
     }
-    // Fallback: try parsing companion mbox file
+
+    // An mbox remains a useful degraded fallback if Thunderbird's cache is
+    // absent, malformed, or reports an unknown (-1) server count.
     let mbox_path = msf_path.with_extension(""); // "INBOX.msf" → "INBOX"
     if mbox_path.exists() {
         return parse_mbox_unread(&mbox_path);
     }
+
     0
 }
 
-/// Parse a Mork (.msf) file to extract unread message count.
-fn parse_mork_unread(msf_path: &Path) -> u32 {
-    let content = match std::fs::read_to_string(msf_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to read Mork file {:?}: {}", msf_path, e);
-            return 0;
-        }
-    };
+fn parse_folder_cache_unread(msf_path: &Path) -> Option<u32> {
+    let cache_path = find_folder_cache(msf_path)?;
+    let contents = std::fs::read(cache_path).ok()?;
+    let cache: serde_json::Value = serde_json::from_slice(&contents).ok()?;
+    let entries = cache.as_object()?;
+    let entry = folder_cache_entry(entries, msf_path)?;
 
-    // Build column dictionary from the dict section: `< ... (hex_id=column_name) ... >`
-    // The dict is a `< ... >` block containing `(XX=name)` entries
-    let mut columns: HashMap<String, String> = HashMap::new();
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
-    let mut dict_depth: i32 = 0;
-
-    // Phase 1: parse dictionary entries inside < ... > blocks
-    while i < chars.len() {
-        if chars[i] == '<' {
-            dict_depth += 1;
-            i += 1;
-            continue;
-        }
-        if chars[i] == '>' {
-            dict_depth -= 1;
-            i += 1;
-            continue;
-        }
-        // Only parse column defs at outermost dict level (depth == 1)
-        if dict_depth == 1 && chars[i] == '(' {
-            i += 1; // Skip '('
-            let id_start = i;
-
-            // Extract hex_id until '='
-            while i < chars.len() && chars[i] != '=' && chars[i] != ')' {
-                i += 1;
-            }
-            if i >= chars.len() || chars[i] != '=' {
-                i += 1;
-                continue;
-            }
-
-            let hex_id = chars[id_start..i].iter().collect::<String>();
-            i += 1; // Skip '='
-
-            // Extract column_name until ')'
-            let name_start = i;
-            while i < chars.len() && chars[i] != ')' {
-                i += 1;
-            }
-            if i < chars.len() {
-                let column_name = chars[name_start..i].iter().collect::<String>();
-                columns.insert(hex_id, column_name);
-            }
-        }
-        i += 1;
+    let total = json_i64(entry.get("totalUnreadMsgs")?)?;
+    // `-1` means Thunderbird has no known server count, so let the mbox
+    // fallback provide an answer rather than displaying a made-up zero.
+    if total < 0 {
+        return None;
     }
 
-    // Find target column id for "numNewMsgs" or fallback "numMsgs"
-    let mut target_id = None;
-    for (id, name) in &columns {
-        if name == "numNewMsgs" {
-            target_id = Some(id.clone());
-            break;
-        }
-    }
-    if target_id.is_none() {
-        for (id, name) in &columns {
-            if name == "numMsgs" {
-                target_id = Some(id.clone());
-                break;
-            }
+    // Thunderbird's `getNumUnread` includes pending messages as well as the
+    // stored folder total. Negative pending values are not meaningful here.
+    let pending = entry
+        .get("pendingUnreadMsgs")
+        .and_then(json_i64)
+        .unwrap_or(0)
+        .max(0);
+
+    Some(
+        (total as u64)
+            .saturating_add(pending as u64)
+            .min(u32::MAX as u64) as u32,
+    )
+}
+
+fn find_folder_cache(msf_path: &Path) -> Option<PathBuf> {
+    msf_path.parent()?.ancestors().find_map(|directory| {
+        let candidate = directory.join("folderCache.json");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn folder_cache_entry<'a>(
+    entries: &'a serde_json::Map<String, serde_json::Value>,
+    msf_path: &Path,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let mut keys = vec![msf_path.to_string_lossy().into_owned()];
+    if let Ok(canonical) = msf_path.canonicalize() {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !keys.contains(&canonical) {
+            keys.push(canonical);
         }
     }
 
-    let target_id = match target_id {
-        Some(id) => id,
-        None => {
-            tracing::warn!("No numNewMsgs or numMsgs column found in {:?}", msf_path);
-            return 0;
-        }
-    };
+    keys.into_iter()
+        .find_map(|key| entries.get(&key)?.as_object())
+}
 
-    // Phase 2: scan data rows for (^target_id=value) patterns
-    // In mork data, column references use ^ prefix: (^A2=0)
-    let mut max_value = 0u32;
-    i = 0;
-
-    while i < chars.len() {
-        if chars[i] == '(' {
-            i += 1;
-
-            // Skip optional ^ prefix
-            let has_caret = i < chars.len() && chars[i] == '^';
-            if has_caret {
-                i += 1;
-            }
-
-            let id_start = i;
-
-            while i < chars.len() && chars[i] != '=' && chars[i] != ')' {
-                i += 1;
-            }
-            if i >= chars.len() || chars[i] != '=' {
-                continue;
-            }
-
-            let field_id = chars[id_start..i].iter().collect::<String>();
-
-            if field_id == target_id {
-                i += 1; // Skip '='
-                let value_start = i;
-
-                while i < chars.len() && chars[i] != ')' {
-                    i += 1;
-                }
-                if i < chars.len() {
-                    let value_str = chars[value_start..i].iter().collect::<String>();
-
-                    let value = if let Ok(v) = value_str.parse::<u32>() {
-                        v
-                    } else {
-                        let hex_str = value_str.trim_start_matches('$');
-                        u32::from_str_radix(hex_str, 16).unwrap_or(0)
-                    };
-
-                    if value > max_value {
-                        max_value = value;
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-
-    max_value
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
 }
 
 /// Parse an mbox file to count unread messages.
-/// Messages are unread if the Read bit (0x0001) is not set and not deleted (0x0008).
+/// Messages are unread when the Read bit is unset and the Expunged bit is not
+/// set. Thunderbird writes both flags to `X-Mozilla-Status`.
 pub(crate) fn parse_mbox_unread(mbox_path: &Path) -> u32 {
     let file = match File::open(mbox_path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("Failed to open mbox file {:?}: {}", mbox_path, e);
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!("Failed to open mbox file {mbox_path:?}: {error}");
             return 0;
         }
     };
@@ -171,61 +99,43 @@ pub(crate) fn parse_mbox_unread(mbox_path: &Path) -> u32 {
     let reader = BufReader::new(file);
     let mut unread_count = 0u32;
     let mut in_headers = false;
-    let mut current_status: Option<u16> = None;
+    let mut current_status = None;
 
     for line_result in reader.lines() {
         let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
+            Ok(line) => line,
+            Err(error) => {
+                tracing::warn!("Failed to read mbox line from {mbox_path:?}: {error}");
+                continue;
+            }
         };
 
-        // New message starts with "From "
         if line.starts_with("From ") {
-            // Process previous message
-            if let Some(status) = current_status {
-                let is_read = (status & 0x0001) != 0;
-                let is_deleted = (status & 0x0008) != 0;
-
-                if !is_read && !is_deleted {
-                    unread_count += 1;
-                }
-            }
-
-            // Start new message
+            unread_count = unread_count.saturating_add(unread_from_status(current_status));
             in_headers = true;
             current_status = None;
             continue;
         }
 
-        if in_headers {
-            // Blank line ends headers
-            if line.trim().is_empty() {
-                in_headers = false;
-                continue;
-            }
-
-            // Parse X-Mozilla-Status header
-            if line.starts_with("X-Mozilla-Status: ") {
-                if let Some(hex_str) = line.strip_prefix("X-Mozilla-Status: ") {
-                    if let Ok(status) = u16::from_str_radix(hex_str.trim(), 16) {
-                        current_status = Some(status);
-                    }
-                }
+        if !in_headers {
+            continue;
+        }
+        if line.trim().is_empty() {
+            in_headers = false;
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("X-Mozilla-Status") {
+                current_status = u16::from_str_radix(value.trim(), 16).ok();
             }
         }
     }
 
-    // Process last message
-    if let Some(status) = current_status {
-        let is_read = (status & 0x0001) != 0;
-        let is_deleted = (status & 0x0008) != 0;
+    unread_count.saturating_add(unread_from_status(current_status))
+}
 
-        if !is_read && !is_deleted {
-            unread_count += 1;
-        }
-    }
-
-    unread_count
+fn unread_from_status(status: Option<u16>) -> u32 {
+    status.is_some_and(|status| status & (MSG_FLAG_READ | MSG_FLAG_EXPUNGED) == 0) as u32
 }
 
 #[cfg(test)]
@@ -233,37 +143,99 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[test]
-    fn test_mbox_unread_count() {
-        // Create temp file with 3 messages: 2 unread (status 0000), 1 read (status 0001)
-        let mbox_content = "From sender@example.com Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\nSubject: Unread 1\n\nBody 1\nFrom sender@example.com Mon Jan  1 00:00:01 2024\nX-Mozilla-Status: 0001\nSubject: Read\n\nBody 2\nFrom sender@example.com Mon Jan  1 00:00:02 2024\nX-Mozilla-Status: 0000\nSubject: Unread 2\n\nBody 3\n";
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(mbox_content.as_bytes()).unwrap();
-        let count = parse_mbox_unread(tmp.path());
-        assert_eq!(count, 2);
+    fn summary_path(profile: &Path) -> PathBuf {
+        let summary_path = profile.join("ImapMail/example.invalid/INBOX.msf");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(&summary_path, "summary is owned by Thunderbird").unwrap();
+        summary_path
+    }
+
+    fn write_folder_cache(profile: &Path, summary: &Path, entry: serde_json::Value) {
+        let mut entries = serde_json::Map::new();
+        entries.insert(summary.to_string_lossy().into_owned(), entry);
+        std::fs::write(
+            profile.join("folderCache.json"),
+            serde_json::to_vec(&serde_json::Value::Object(entries)).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn test_mbox_with_deleted() {
-        // deleted message (0x0008) should not count
-        let mbox_content = "From sender@example.com Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0008\nSubject: Deleted\n\nBody\n";
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(mbox_content.as_bytes()).unwrap();
-        let count = parse_mbox_unread(tmp.path());
-        assert_eq!(count, 0);
+    fn exact_folder_cache_entry_is_authoritative_and_includes_pending() {
+        let profile = tempfile::tempdir().unwrap();
+        let summary = summary_path(profile.path());
+        write_folder_cache(
+            profile.path(),
+            &summary,
+            serde_json::json!({
+                "totalUnreadMsgs": 540,
+                "pendingUnreadMsgs": 13,
+                "totalMsgs": 999,
+                "serverUnseen": 553,
+            }),
+        );
+
+        assert_eq!(parse_unread_count(&summary), 553);
     }
 
     #[test]
-    fn test_empty_file() {
+    fn cache_lookup_uses_the_full_summary_path_not_just_inbox_name() {
+        let profile = tempfile::tempdir().unwrap();
+        let summary = summary_path(profile.path());
+        let other_summary = profile.path().join("ImapMail/other.invalid/INBOX.msf");
+        let mbox_path = summary.with_extension("");
+        std::fs::write(
+            &mbox_path,
+            "From sender@example.com Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\n\nBody\n",
+        )
+        .unwrap();
+
+        let mut entries = serde_json::Map::new();
+        entries.insert(
+            other_summary.to_string_lossy().into_owned(),
+            serde_json::json!({"totalUnreadMsgs": 99, "pendingUnreadMsgs": 0}),
+        );
+        std::fs::write(
+            profile.path().join("folderCache.json"),
+            serde_json::to_vec(&serde_json::Value::Object(entries)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(parse_unread_count(&summary), 1);
+    }
+
+    #[test]
+    fn unknown_cache_total_falls_back_to_mbox_status() {
+        let profile = tempfile::tempdir().unwrap();
+        let summary = summary_path(profile.path());
+        let mbox_path = summary.with_extension("");
+        write_folder_cache(
+            profile.path(),
+            &summary,
+            serde_json::json!({"totalUnreadMsgs": -1, "pendingUnreadMsgs": 0}),
+        );
+        std::fs::write(
+            &mbox_path,
+            "From sender@example.com Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\n\nBody\n",
+        )
+        .unwrap();
+
+        assert_eq!(parse_unread_count(&summary), 1);
+    }
+
+    #[test]
+    fn mbox_unread_count_excludes_read_and_expunged_messages() {
+        let mbox_content = "From sender@example.com Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\n\nUnread\nFrom sender@example.com Mon Jan  1 00:00:01 2024\nx-mozilla-status: 0001\n\nRead\nFrom sender@example.com Mon Jan  1 00:00:02 2024\nX-Mozilla-Status: 0008\n\nExpunged\n";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(mbox_content.as_bytes()).unwrap();
+
+        assert_eq!(parse_mbox_unread(tmp.path()), 1);
+    }
+
+    #[test]
+    fn empty_or_missing_sources_report_zero() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         assert_eq!(parse_unread_count(tmp.path()), 0);
-    }
-
-    #[test]
-    fn test_nonexistent_file() {
-        assert_eq!(
-            parse_unread_count(std::path::Path::new("/nonexistent/file.msf")),
-            0
-        );
+        assert_eq!(parse_unread_count(Path::new("/nonexistent/INBOX.msf")), 0);
     }
 }

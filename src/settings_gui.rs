@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::Command;
 
 const SETTINGS_SCRIPT: &str = include_str!("settings_dialog.py");
@@ -11,19 +12,21 @@ pub fn open_settings() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let script_path = std::env::temp_dir().join("thundertray_settings.py");
-    std::fs::write(&script_path, SETTINGS_SCRIPT)?;
+    let mut script_file = tempfile::Builder::new()
+        .prefix("thundertray-settings-")
+        .suffix(".py")
+        .tempfile()?;
+    script_file.write_all(SETTINGS_SCRIPT.as_bytes())?;
+    script_file.flush()?;
 
     let output = Command::new("python3")
-        .arg(&script_path)
+        .arg(script_file.path())
         .arg(&config.general.thunderbird_command)
         .arg(config.general.auto_start_thunderbird.to_string())
         .arg(&config.appearance.badge_color)
         .arg(&config.appearance.badge_text_color)
         .arg(config.monitoring.poll_interval_secs.to_string())
         .output()?;
-
-    let _ = std::fs::remove_file(&script_path);
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -35,11 +38,11 @@ pub fn open_settings() -> Result<(), Box<dyn std::error::Error>> {
             }
             config.general.auto_start_thunderbird = lines[1].trim() == "true";
             let badge = lines[2].trim();
-            if badge.starts_with('#') && badge.len() >= 4 {
+            if valid_hex_color(badge) {
                 config.appearance.badge_color = badge.to_string();
             }
             let text_col = lines[3].trim();
-            if text_col.starts_with('#') && text_col.len() >= 4 {
+            if valid_hex_color(text_col) {
                 config.appearance.badge_text_color = text_col.to_string();
             }
             if let Ok(secs) = lines[4].trim().parse::<u64>() {
@@ -58,6 +61,12 @@ pub fn open_settings() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn valid_hex_color(value: &str) -> bool {
+    matches!(value.len(), 4 | 7)
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Open settings from the tray (spawns as detached child process so it doesn't block)
@@ -98,4 +107,17 @@ fn has_command(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_hex_color;
+
+    #[test]
+    fn validates_supported_color_forms() {
+        assert!(valid_hex_color("#F00"));
+        assert!(valid_hex_color("#12aBcF"));
+        assert!(!valid_hex_color("#12"));
+        assert!(!valid_hex_color("#GGGGGG"));
+    }
 }
